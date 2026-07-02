@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Web tóm tắt tài liệu</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">AI document summarizer</p>
+            <h1>Tóm tắt tài liệu</h1>
+          </div>
+          <span id="statusBadge" class="status-badge">Sẵn sàng</span>
+        </header>
+
+        <form id="summaryForm" class="summary-form">
+          <div class="field-grid">
+            <label>
+              <span>Provider</span>
+              <select name="provider" id="provider">
+                <option value="openai">OpenAI</option>
+                <option value="claude">Claude</option>
+                <option value="gemini">Gemini</option>
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+
+            <div class="model-field">
+              <span>Model</span>
+              <div class="model-row">
+                <select name="model" id="model"></select>
+                <button id="loadModelsButton" type="button" class="ghost-button">Tải model</button>
+              </div>
+              <input id="customModel" class="is-hidden" type="text" placeholder="Nhập model custom" />
+              <small id="modelHint">Danh sách mặc định, có thể tải model theo API key.</small>
+            </div>
+
+            <label>
+              <span>API key</span>
+              <input name="api_key" type="password" autocomplete="off" placeholder="Có thể để trống nếu đã cấu hình env" />
+            </label>
+
+            <label id="baseUrlField" class="is-hidden">
+              <span>Base URL</span>
+              <input name="base_url" id="baseUrl" type="url" placeholder="https://api.example.com/v1" />
+            </label>
+          </div>
+
+          <label class="upload-zone" for="file">
+            <input id="file" name="file" type="file" accept=".txt,.pdf,.docx" required />
+            <strong id="fileName">Chọn file .txt, .pdf hoặc .docx</strong>
+            <span>Kéo thả hoặc bấm để tải tài liệu lên</span>
+          </label>
+
+          <div class="actions">
+            <button id="submitButton" type="submit">Tóm tắt</button>
+            <button id="clearButton" type="button">Xóa</button>
+          </div>
+        </form>
+
+        <section class="result-panel" aria-live="polite">
+          <div class="result-header">
+            <h2>Kết quả</h2>
+            <div class="result-tools">
+              <span id="metaText"></span>
+              <button id="copyResultButton" type="button" class="ghost-button" disabled>Sao chép</button>
+              <button id="downloadResultButton" type="button" class="ghost-button" disabled>Xuất file</button>
+            </div>
+          </div>
+          <pre id="summaryOutput">Kết quả tóm tắt sẽ hiển thị tại đây.</pre>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
