@@ -9,11 +9,55 @@ from typing import Any
 import httpx
 
 
-MAX_INPUT_CHARS = 60_000
+MAX_INPUT_CHARS = 1_000_000
 DIRECT_SUMMARY_THRESHOLD = 12_000
-CHUNK_TARGET_CHARS = 10_000
 TOC_SCAN_CHARS = 12_000
-REQUEST_TIMEOUT = 90
+REQUEST_TIMEOUT = 600
+
+MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int]] = {
+    "openai": {
+        "gpt-5.5": 131072,
+        "gpt-5.4": 131072,
+        "gpt-5.4-mini": 131072,
+        "gpt-5.4-nano": 131072,
+        "gpt-4.1": 1_048_576,
+        "gpt-4.1-mini": 1_048_576,
+        "*": 131072,
+    },
+    "claude": {
+        "claude-fable-5": 200_000,
+        "claude-opus-4-8": 200_000,
+        "claude-sonnet-5": 200_000,
+        "claude-haiku-4-5": 200_000,
+        "*": 200_000,
+    },
+    "gemini": {
+        "gemini-3.5-flash": 1_048_576,
+        "gemini-3.1-pro": 1_048_576,
+        "gemini-2.5-flash": 1_048_576,
+        "gemini-2.5-pro": 1_048_576,
+        "*": 1_048_576,
+    },
+    "custom": {"*": 131_072},
+}
+
+MAX_OUTPUT_TOKENS: dict[str, int] = {
+    "openai": 8192,
+    "claude": 8192,
+    "gemini": 8192,
+    "custom": 8192,
+}
+PROMPT_OVERHEAD_TOKENS = 1500
+
+
+def _max_input_chars(provider: str, model: str) -> int:
+    model_map = MODEL_CONTEXT_WINDOWS.get(provider, {})
+    context = model_map.get(model) or model_map.get("*", 131072)
+    max_output = MAX_OUTPUT_TOKENS.get(provider, 8192)
+    available_tokens = context - max_output - PROMPT_OVERHEAD_TOKENS
+    return max(available_tokens * 4, 4000)
+
+
 SECTION_KEYWORDS = (
     "chuong",
     "phuong",
@@ -83,7 +127,9 @@ class AIClientError(Exception):
     """Raised when an AI provider request fails."""
 
 
-async def list_available_models(provider: str, api_key: str, base_url: str) -> dict[str, Any]:
+async def list_available_models(
+    provider: str, api_key: str, base_url: str
+) -> dict[str, Any]:
     provider = provider.strip().lower()
     api_key = api_key.strip() or _api_key_from_env(provider)
     base_url = base_url.strip().rstrip("/")
@@ -106,7 +152,9 @@ async def list_available_models(provider: str, api_key: str, base_url: str) -> d
     else:
         if not base_url:
             raise AIClientError("Provider custom cần base URL để tải danh sách model.")
-        models = await _list_openai_compatible_models(api_key=api_key, base_url=base_url)
+        models = await _list_openai_compatible_models(
+            api_key=api_key, base_url=base_url
+        )
 
     return {"source": "live", "models": models or DEFAULT_MODEL_OPTIONS[provider]}
 
@@ -128,14 +176,18 @@ async def summarize_text(
     if not model:
         raise AIClientError("Vui lòng nhập model.")
     if not api_key:
-        raise AIClientError("Vui lòng nhập API key hoặc cấu hình biến môi trường tương ứng.")
+        raise AIClientError(
+            "Vui lòng nhập API key hoặc cấu hình biến môi trường tương ứng."
+        )
     if provider == "custom" and not base_url:
         raise AIClientError("Provider custom cần base URL.")
 
     normalized_text = _normalize_text(text)
     source_text = normalized_text[:MAX_INPUT_CHARS]
-    chunks = _split_into_chunks(source_text, CHUNK_TARGET_CHARS)
     truncated = len(normalized_text) > MAX_INPUT_CHARS
+
+    max_chars = _max_input_chars(provider, model)
+    chunks = _split_into_chunks(source_text, max_chars)
 
     if len(chunks) == 1 and len(source_text) <= DIRECT_SUMMARY_THRESHOLD:
         prompt = _build_direct_summary_prompt(source_text, truncated=truncated)
@@ -147,28 +199,61 @@ async def summarize_text(
             prompt=prompt,
         )
 
-    chunk_notes = []
-    for index, chunk in enumerate(chunks, start=1):
-        chunk_prompt = _build_chunk_summary_prompt(
-            chunk=chunk,
-            chunk_index=index,
-            total_chunks=len(chunks),
-            truncated=truncated,
-        )
-        chunk_summary = await _generate_summary(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            prompt=chunk_prompt,
-        )
-        chunk_notes.append(
-            f"Phan {index}/{len(chunks)}: {chunk.title}\n{chunk_summary}"
-        )
+    # Level 1 + 2: summarize sections, synthesize sub-chunks if needed
+    section_summaries: list[tuple[str, str]] = []
+    for chunk in chunks:
+        if len(chunk.content) <= max_chars:
+            prompt = _build_chunk_summary_prompt(
+                chunk=chunk,
+                chunk_index=len(section_summaries) + 1,
+                total_chunks=len(chunks),
+                truncated=truncated,
+            )
+            summary = await _generate_summary(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                prompt=prompt,
+            )
+            section_summaries.append((chunk.title, summary))
+        else:
+            # Level 2: split large section into sub-chunks
+            sub_chunks = _split_large_section(chunk.title, chunk.content, max_chars)
+            sub_summaries: list[str] = []
+            for i, sub in enumerate(sub_chunks, start=1):
+                prompt = _build_chunk_summary_prompt(
+                    chunk=sub,
+                    chunk_index=i,
+                    total_chunks=len(sub_chunks),
+                    truncated=truncated,
+                )
+                sub_summary = await _generate_summary(
+                    provider=provider,
+                    model=model,
+                    api_key=api_key,
+                    base_url=base_url,
+                    prompt=prompt,
+                )
+                sub_summaries.append(sub_summary)
 
+            # Synthesize sub-summaries into section summary
+            synth_prompt = _build_sub_section_synthesis_prompt(
+                chunk.title, sub_summaries
+            )
+            merged = await _generate_summary(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                prompt=synth_prompt,
+            )
+            section_summaries.append((chunk.title, merged))
+
+    # Level 3: synthesize all section summaries into final
     final_prompt = _build_final_summary_prompt(
-        chunk_notes=chunk_notes,
-        section_titles=[chunk.title for chunk in chunks],
+        chunk_notes=[s for _, s in section_summaries],
+        section_titles=[t for t, _ in section_summaries],
         original_length=len(source_text),
         truncated=truncated,
     )
@@ -179,6 +264,42 @@ async def summarize_text(
         base_url=base_url,
         prompt=final_prompt,
     )
+
+
+def export_to_md(
+    filename: str,
+    final_summary: str,
+    section_summaries: list[tuple[str, str]],
+    char_count: int,
+) -> str:
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines: list[str] = [
+        f"# Tóm tắt tài liệu: {filename}",
+        "",
+        f"- **File gốc:** {filename}",
+        f"- **Số ký tự:** {char_count:,}",
+        f"- **Ngày tạo:** {timestamp}",
+        "",
+        "---",
+        "",
+        "## Tổng hợp",
+        "",
+        final_summary,
+        "",
+        "---",
+        "",
+        "## Tóm tắt chi tiết từng phần",
+        "",
+    ]
+    for title, summary in section_summaries:
+        lines.append(f"### {title}")
+        lines.append("")
+        lines.append(summary)
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _api_key_from_env(provider: str) -> str:
@@ -268,7 +389,11 @@ def _split_by_length(text: str, target_chars: int) -> list[SectionChunk]:
                 current = []
                 current_len = 0
 
-            chunks.extend(_split_large_section(f"Cum noi dung {len(chunks) + 1}", block, target_chars))
+            chunks.extend(
+                _split_large_section(
+                    f"Cum noi dung {len(chunks) + 1}", block, target_chars
+                )
+            )
             continue
 
         current.append(block)
@@ -328,7 +453,9 @@ def _build_sections_from_titles(
         if not normalized_line:
             continue
         for title, normalized_title in zip(toc_titles, normalized_toc):
-            if normalized_line == normalized_title or normalized_line.startswith(normalized_title):
+            if normalized_line == normalized_title or normalized_line.startswith(
+                normalized_title
+            ):
                 if matches and matches[-1][1] == title:
                     break
                 matches.append((line_index, title))
@@ -356,7 +483,9 @@ def _build_sections_from_detected_headings(
     return _materialize_sections(lines, matches)
 
 
-def _materialize_sections(lines: list[str], matches: list[tuple[int, str]]) -> list[tuple[str, str]]:
+def _materialize_sections(
+    lines: list[str], matches: list[tuple[int, str]]
+) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     for idx, (start_line, title) in enumerate(matches):
         end_line = matches[idx + 1][0] if idx + 1 < len(matches) else len(lines)
@@ -367,7 +496,9 @@ def _materialize_sections(lines: list[str], matches: list[tuple[int, str]]) -> l
     return sections
 
 
-def _split_large_section(title: str, content: str, target_chars: int) -> list[SectionChunk]:
+def _split_large_section(
+    title: str, content: str, target_chars: int
+) -> list[SectionChunk]:
     blocks = [block.strip() for block in content.split("\n\n") if block.strip()]
     if not blocks:
         blocks = [content]
@@ -455,7 +586,9 @@ def _looks_like_heading(line: str) -> bool:
 
 def _normalize_for_match(text: str) -> str:
     decomposed = unicodedata.normalize("NFD", text)
-    ascii_text = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    ascii_text = "".join(
+        char for char in decomposed if unicodedata.category(char) != "Mn"
+    )
     ascii_text = ascii_text.replace("đ", "d").replace("Đ", "D")
     ascii_text = re.sub(r"\s+", " ", ascii_text).strip().lower()
     return ascii_text
@@ -476,9 +609,7 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
 def _build_direct_summary_prompt(text: str, truncated: bool) -> str:
     note = ""
     if truncated:
-        note = (
-            "\nLuu y: tai lieu goc dai hon gioi han xu ly nen chi phan dau da duoc dung de tao ban tom tat."
-        )
+        note = "\nLuu y: tai lieu goc dai hon gioi han xu ly nen chi phan dau da duoc dung de tao ban tom tat."
 
     return f"""Ban la tro ly chuyen tom tat tai lieu dai theo huong day du y, khong tom tat qua ngan.
 Muc tieu la giu lai hau het y chinh quan trong thay vi chi viet vai cau tong quan.{note}
@@ -550,6 +681,22 @@ Noi dung phan:
 \"\"\""""
 
 
+def _build_sub_section_synthesis_prompt(title: str, sub_summaries: list[str]) -> str:
+    parts = "\n\n".join(f"### Phần {i + 1}\n{s}" for i, s in enumerate(sub_summaries))
+    return f"""Ban dang tong hop cac phan nho cung mot muc '{title}' trong tai lieu.
+
+Hay hop nhat chung lai thanh mot ban tom tat thong nhat cho rieng muc nay, theo khung:
+
+1. Y chinh cua muc {title}
+2. Cac chi tiet quan trong (so lieu, ten rieng, thoi gian)
+3. Ket luan hoac diem noi bat
+
+Cac phan nho:
+{parts}
+
+Tra loi bang tieng Viet co day du dau."""
+
+
 def _build_final_summary_prompt(
     chunk_notes: list[str],
     section_titles: list[str],
@@ -558,9 +705,7 @@ def _build_final_summary_prompt(
 ) -> str:
     note = ""
     if truncated:
-        note = (
-            "\nLuu y: tai lieu da bi cat o gioi han xu ly, vi vay chi tong hop tren phan noi dung da duoc doc."
-        )
+        note = "\nLuu y: tai lieu da bi cat o gioi han xu ly, vi vay chi tong hop tren phan noi dung da duoc doc."
 
     merged_notes = "\n\n".join(chunk_notes)
     section_overview = "\n".join(f"- {title}" for title in section_titles)
@@ -622,11 +767,16 @@ async def _generate_summary(
     )
 
 
-async def _call_openai_compatible(api_key: str, model: str, prompt: str, base_url: str) -> str:
+async def _call_openai_compatible(
+    api_key: str, model: str, prompt: str, base_url: str
+) -> str:
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "Ban tom tat tai lieu chinh xac, ro rang va day du y."},
+            {
+                "role": "system",
+                "content": "Ban tom tat tai lieu chinh xac, ro rang va day du y.",
+            },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
@@ -647,7 +797,10 @@ async def _call_openai_responses(api_key: str, model: str, prompt: str) -> str:
     payload = {
         "model": model,
         "input": [
-            {"role": "system", "content": "Ban tom tat tai lieu chinh xac, ro rang va day du y."},
+            {
+                "role": "system",
+                "content": "Ban tom tat tai lieu chinh xac, ro rang va day du y.",
+            },
             {"role": "user", "content": prompt},
         ],
     }
@@ -694,7 +847,9 @@ async def _call_claude(api_key: str, model: str, prompt: str) -> str:
 
     try:
         parts = data["content"]
-        return "\n".join(part["text"] for part in parts if part.get("type") == "text").strip()
+        return "\n".join(
+            part["text"] for part in parts if part.get("type") == "text"
+        ).strip()
     except (KeyError, TypeError) as exc:
         raise AIClientError("Claude tra ve du lieu khong dung dinh dang.") from exc
 
@@ -722,7 +877,11 @@ async def _list_openai_compatible_models(api_key: str, base_url: str) -> list[st
         headers={"Authorization": f"Bearer {api_key}"},
     )
     raw_models = data.get("data", [])
-    ids = [item.get("id") for item in raw_models if isinstance(item, dict) and item.get("id")]
+    ids = [
+        item.get("id")
+        for item in raw_models
+        if isinstance(item, dict) and item.get("id")
+    ]
     return _sort_model_ids(ids)
 
 
@@ -735,7 +894,11 @@ async def _list_claude_models(api_key: str) -> list[str]:
         },
     )
     raw_models = data.get("data", [])
-    ids = [item.get("id") for item in raw_models if isinstance(item, dict) and item.get("id")]
+    ids = [
+        item.get("id")
+        for item in raw_models
+        if isinstance(item, dict) and item.get("id")
+    ]
     return _sort_model_ids(ids)
 
 
@@ -758,7 +921,9 @@ async def _list_gemini_models(api_key: str) -> list[str]:
     return _sort_model_ids(ids)
 
 
-async def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+async def _post_json(
+    url: str, headers: dict[str, str], payload: dict[str, Any]
+) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(url, headers=headers, json=payload)

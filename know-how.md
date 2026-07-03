@@ -21,3 +21,13 @@
 - Nếu không tìm được mục lục hợp lệ, hệ thống fallback sang nhận diện heading trực tiếp trong nội dung; chỉ khi vẫn không đủ cấu trúc mới chia theo cụm độ dài.
 - Prompt tóm tắt từng đoạn và prompt tổng hợp cuối đều đã nhận thêm tên phần để bản tóm tắt bám đúng cấu trúc tài liệu hơn.
 - Khu vực kết quả hiện có thêm `Sao chép` vào clipboard và `Xuất file` `.txt`; cả hai nút chỉ bật khi đã có bản tóm tắt thật sự.
+
+## 2026-07-03
+
+- Thay `CHUNK_TARGET_CHARS` cố định (10K) bằng `_max_input_chars()` động dựa trên context window của model.
+- Thêm `MODEL_CONTEXT_WINDOWS` map: gpt-4.1/gpt-4.1-mini 1M, claude 200K, gemini 1M, openai/default 128K.
+- Công thức: `available_chars = (context_window - max_output_tokens - 1500) * 4`.
+- Chuyển pipeline từ 2 tầng lên 3 tầng: sub-chunk summary → section synthesis → final synthesis.
+- Khi section > context window, được chia thành sub-chunk vừa khít, tóm tắt từng cái, rồi tổng hợp lại bằng `_build_sub_section_synthesis_prompt()` trước khi đưa vào tổng hợp cuối.
+- Thêm `export_to_md()` xuất kết quả ra markdown với header (tên file, số ký tự, ngày tạo), phần tổng hợp và tóm tắt chi tiết từng phần.
+- Cập nhật SKILL.md sections 8, 9, 10 tương ứng.

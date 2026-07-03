@@ -190,3 +190,187 @@ Nếu cần triển khai nhanh, ưu tiên:
 - Endpoint `/models`.
 - Một giao diện tối giản nhưng đầy đủ chức năng.
 - Pipeline tóm tắt hai tầng cho tài liệu dài: `chunk summary -> final synthesis`.
+
+### 8. Chia đoạn theo context window của model
+
+Không dùng kích thước chunk cố định. Thay vào đó, tra context window của model đang dùng, trừ đi phần output tokens và prompt overhead, rồi chia nội dung vừa khít với model.
+
+```python
+MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int]] = {
+    "openai": {
+        "gpt-5.5": 131072, "gpt-5.4": 131072, "gpt-5.4-mini": 131072,
+        "gpt-5.4-nano": 131072, "gpt-4.1": 1048576, "gpt-4.1-mini": 1048576,
+        "*": 131072,
+    },
+    "claude": {
+        "claude-fable-5": 200000, "claude-opus-4-8": 200000,
+        "claude-sonnet-5": 200000, "claude-haiku-4-5": 200000,
+        "*": 200000,
+    },
+    "gemini": {
+        "gemini-3.5-flash": 1048576, "gemini-3.1-pro": 1048576,
+        "gemini-2.5-flash": 1048576, "gemini-2.5-pro": 1048576,
+        "*": 1048576,
+    },
+    "custom": {"*": 131072},
+}
+
+MAX_OUTPUT_TOKENS: dict[str, int] = {
+    "openai": 8192, "claude": 8192, "gemini": 8192, "custom": 8192,
+}
+PROMPT_OVERHEAD_TOKENS = 1500
+
+def _max_input_chars(provider: str, model: str) -> int:
+    model_map = MODEL_CONTEXT_WINDOWS.get(provider, {})
+    context = model_map.get(model) or model_map.get("*", 131072)
+    max_output = MAX_OUTPUT_TOKENS.get(provider, 8192)
+    available_tokens = context - max_output - PROMPT_OVERHEAD_TOKENS
+    return max(available_tokens * 4, 4000)
+```
+
+Công thức: `available_chars = (context_window - max_output_tokens - 1500) * 4`.
+
+Ví dụ: gpt-4.1-mini (1M context) → `(1_048_576 - 8192 - 1500) * 4 ≈ 4.1M chars`.
+gemini-2.5-flash (1M context) → tương tự ~4.1M chars.
+claude-haiku-4-5 (200K context) → `(200_000 - 8192 - 1500) * 4 ≈ 761K chars`.
+
+Nếu section content > available_chars, chia nhỏ thành các sub-chunk vừa khít.
+
+### 9. Luồng tóm tắt 3 tầng (3-level summarization)
+
+Khi một section quá lớn so với context, nó được chia nhỏ, tóm tắt từng sub-chunk, rồi tổng hợp lại trước khi tổng hợp toàn bộ.
+
+```
+Tài liệu gốc
+  │
+  ├─ Chương 1 (300K chars, lớn hơn context)
+  │    ├─ Sub-chunk 1 ──→ summary 1
+  │    ├─ Sub-chunk 2 ──→ summary 2
+  │    ├─ Sub-chunk 3 ──→ summary 3
+  │    └─ [Synthesize] ──→ Tổng hợp Chương 1
+  │
+  ├─ Chương 2 (50K chars, vừa context) ──→ summary trực tiếp
+  │
+  └─ [Synthesize tất cả] ──→ Bản tóm tắt cuối
+```
+
+```python
+async def summarize_text(provider, model, api_key, base_url, text) -> str:
+    max_chars = _max_input_chars(provider, model)
+    chunks = _split_into_chunks(text, max_chars)
+
+    # Level 1 + 2: summarize sections, synthesize sub-chunks if needed
+    section_summaries: list[tuple[str, str]] = []
+    for chunk in chunks:
+        if len(chunk.content) <= max_chars:
+            summary = await _summarize_section(provider, model, api_key, base_url, chunk)
+            section_summaries.append((chunk.title, summary))
+        else:
+            # Split large section into context-fitting sub-chunks
+            sub_chunks = _split_large_section(chunk.title, chunk.content, max_chars)
+            sub_summaries = []
+            for i, sub in enumerate(sub_chunks):
+                print(f"  Tóm tắt sub-chunk {i+1}/{len(sub_chunks)} của '{chunk.title}'")
+                s = await _summarize_section(provider, model, api_key, base_url, sub)
+                sub_summaries.append(s)
+            # Level 2: synthesize sub-summaries → section summary
+            merged = await _synthesize_sub_sections(
+                provider, model, api_key, base_url, chunk.title, sub_summaries
+            )
+            section_summaries.append((chunk.title, merged))
+
+    # Level 3: synthesize all section summaries → final
+    return await _synthesize_final(
+        provider, model, api_key, base_url, section_summaries, len(text)
+    )
+```
+
+Prompt tổng hợp các sub-chunk của cùng một section:
+
+```python
+def _build_sub_section_synthesis_prompt(title: str, sub_summaries: list[str]) -> str:
+    parts = "\n\n".join(
+        f"### Phần {i+1}\n{s}" for i, s in enumerate(sub_summaries)
+    )
+    return f"""Ban dang tong hop cac phan nho cung mot muc '{title}' trong tai lieu.
+
+Hay hop nhat chung lai thanh mot ban tom tat thong nhat cho rieng muc nay, theo khung:
+
+1. Y chinh cua muc {title}
+2. Cac chi tiet quan trong (so lieu, ten rieng, thoi gian)
+3. Ket luan hoac diem noi bat
+
+Cac phan nho:
+{parts}
+
+Tra loi bang tieng Viet co day du dau."""
+```
+
+### 10. Export kết quả ra file .md
+
+```python
+from datetime import datetime
+
+def export_to_md(
+    filename: str,
+    final_summary: str,
+    section_summaries: list[tuple[str, str]],
+    char_count: int,
+) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"# Tóm tắt tài liệu: {filename}",
+        "",
+        f"- **File gốc:** {filename}",
+        f"- **Số ký tự:** {char_count:,}",
+        f"- **Ngày tạo:** {timestamp}",
+        "",
+        "---",
+        "",
+        "## Tổng hợp",
+        "",
+        final_summary,
+        "",
+        "---",
+        "",
+        "## Tóm tắt chi tiết từng phần",
+        "",
+    ]
+    for title, summary in section_summaries:
+        lines.append(f"### {title}")
+        lines.append("")
+        lines.append(summary)
+        lines.append("")
+
+    return "\n".join(lines)
+```
+
+Thêm endpoint export trong `app.py`:
+
+```python
+@app.post("/export")
+async def export_summary(
+    provider: str = Form(...),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    base_url: str = Form(""),
+    file: UploadFile = File(...),
+):
+    text = await extract_text_from_upload(file)
+    max_chars = _max_input_chars(provider, model)
+    chunks = _split_into_chunks(text, max_chars)
+    # ... full summarization pipeline ...
+    md_content = export_to_md(
+        filename=file.filename or "document",
+        final_summary=final_summary,
+        section_summaries=section_summaries,
+        char_count=len(text),
+    )
+    return Response(
+        content=md_content,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="{Path(file.filename).stem}_summary.md"'
+        },
+    )
+```

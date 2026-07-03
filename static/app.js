@@ -185,16 +185,31 @@ downloadResultButton.addEventListener("click", () => {
     return;
   }
 
-  const fileBase = (fileInput.files[0]?.name || "tom-tat")
-    .replace(/\.[^.]+$/, "")
-    .replace(/[^\p{L}\p{N}\-_ ]/gu, "")
-    .trim()
-    .replace(/\s+/g, "-");
-  const blob = new Blob([output.textContent], { type: "text/plain;charset=utf-8" });
+  const now = new Date();
+  const timestamp = now.toISOString().slice(0, 19).replace("T", " ");
+  const filename = fileInput.files[0]?.name || "document";
+  const fileBase = filename.replace(/\.[^.]+$/, "")
+    .replace(/[^\p{L}\p{N}\-_ ]/gu, "").trim().replace(/\s+/g, "-") || "tom-tat";
+  const chars = metaText.textContent.match(/[\d.]+/)?.[0] || "?";
+
+  const md = [
+    `# Tóm tắt tài liệu: ${filename}`,
+    "",
+    `- **File gốc:** ${filename}`,
+    `- **Số ký tự:** ${chars}`,
+    `- **Ngày tạo:** ${timestamp}`,
+    "",
+    "---",
+    "",
+    output.textContent,
+    "",
+  ].join("\n");
+
+  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `${fileBase || "tom-tat"}-summary.txt`;
+  anchor.download = `${fileBase}-summary.md`;
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
