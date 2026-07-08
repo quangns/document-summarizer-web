@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import unicodedata
@@ -7,6 +8,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+CONCURRENCY_LIMIT = 2
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 2.0
 
 
 MAX_INPUT_CHARS = 1_000_000
@@ -187,11 +192,11 @@ async def summarize_text(
     truncated = len(normalized_text) > MAX_INPUT_CHARS
 
     max_chars = _max_input_chars(provider, model)
-    chunks = _split_into_chunks(source_text, max_chars)
 
-    if len(chunks) == 1 and len(source_text) <= DIRECT_SUMMARY_THRESHOLD:
+    # Nếu toàn bộ văn bản vừa context → 1 API call duy nhất, không chunk
+    if len(source_text) <= max_chars * 0.8:
         prompt = _build_direct_summary_prompt(source_text, truncated=truncated)
-        return await _generate_summary(
+        return await _call_with_retry(
             provider=provider,
             model=model,
             api_key=api_key,
@@ -199,56 +204,44 @@ async def summarize_text(
             prompt=prompt,
         )
 
-    # Level 1 + 2: summarize sections, synthesize sub-chunks if needed
-    section_summaries: list[tuple[str, str]] = []
-    for chunk in chunks:
+    chunks = _split_into_chunks(source_text, max_chars)
+
+    # Level 1 + 2: summarize sections concurrently, synthesize sub-chunks if needed
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+    async def _call(prompt: str) -> str:
+        async with sem:
+            return await _call_with_retry(
+                provider=provider, model=model, api_key=api_key,
+                base_url=base_url, prompt=prompt,
+            )
+
+    async def _summarize_one(chunk: SectionChunk) -> tuple[str, str]:
         if len(chunk.content) <= max_chars:
             prompt = _build_chunk_summary_prompt(
-                chunk=chunk,
-                chunk_index=len(section_summaries) + 1,
-                total_chunks=len(chunks),
+                chunk=chunk, chunk_index=0, total_chunks=len(chunks),
                 truncated=truncated,
             )
-            summary = await _generate_summary(
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                base_url=base_url,
-                prompt=prompt,
-            )
-            section_summaries.append((chunk.title, summary))
-        else:
-            # Level 2: split large section into sub-chunks
-            sub_chunks = _split_large_section(chunk.title, chunk.content, max_chars)
-            sub_summaries: list[str] = []
-            for i, sub in enumerate(sub_chunks, start=1):
-                prompt = _build_chunk_summary_prompt(
-                    chunk=sub,
-                    chunk_index=i,
-                    total_chunks=len(sub_chunks),
-                    truncated=truncated,
-                )
-                sub_summary = await _generate_summary(
-                    provider=provider,
-                    model=model,
-                    api_key=api_key,
-                    base_url=base_url,
-                    prompt=prompt,
-                )
-                sub_summaries.append(sub_summary)
+            summary = await _call(prompt)
+            return (chunk.title, summary)
 
-            # Synthesize sub-summaries into section summary
-            synth_prompt = _build_sub_section_synthesis_prompt(
-                chunk.title, sub_summaries
+        # Level 2: split large section into sub-chunks
+        sub_chunks = _split_large_section(chunk.title, chunk.content, max_chars)
+        sub_tasks = []
+        for sub in sub_chunks:
+            p = _build_chunk_summary_prompt(
+                chunk=sub, chunk_index=0, total_chunks=len(sub_chunks),
+                truncated=truncated,
             )
-            merged = await _generate_summary(
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                base_url=base_url,
-                prompt=synth_prompt,
-            )
-            section_summaries.append((chunk.title, merged))
+            sub_tasks.append(_call(p))
+
+        sub_summaries = await asyncio.gather(*sub_tasks)
+        synth_prompt = _build_sub_section_synthesis_prompt(chunk.title, sub_summaries)
+        merged = await _call(synth_prompt)
+        return (chunk.title, merged)
+
+    results = await asyncio.gather(*[_summarize_one(c) for c in chunks])
+    section_summaries = list(results)
 
     # Level 3: synthesize all section summaries into final
     final_prompt = _build_final_summary_prompt(
@@ -257,7 +250,7 @@ async def summarize_text(
         original_length=len(source_text),
         truncated=truncated,
     )
-    return await _generate_summary(
+    return await _call_with_retry(
         provider=provider,
         model=model,
         api_key=api_key,
@@ -744,6 +737,35 @@ Ghi chu tu cac phan:
 \"\"\"
 {merged_notes}
 \"\"\""""
+
+
+async def _call_with_retry(
+    provider: str, model: str, api_key: str, base_url: str, prompt: str,
+) -> str:
+    last_error = ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await _generate_summary(
+                provider=provider, model=model, api_key=api_key,
+                base_url=base_url, prompt=prompt,
+            )
+        except AIClientError as exc:
+            msg = str(exc).lower()
+            last_error = str(exc)
+            is_rate = any(k in msg for k in (
+                "high demand", "rate limit", "too many", "429", "503",
+                "capacity", "overloaded", "try again", "quota exceeded",
+                "quota", "retry", "resource exhausted", "limit",
+            ))
+            if not is_rate or attempt == MAX_RETRIES - 1:
+                raise
+            # Parse "retry in Xs" từ error message (Gemini gửi exact time)
+            import re
+            m = re.search(r"retry in\s+([\d.]+)\s*s", str(exc), re.IGNORECASE)
+            delay = float(m.group(1)) + 1 if m else RETRY_BASE_DELAY * (2 ** attempt)
+            print(f"  API busy (lần {attempt+1}), đợi {delay:.0f}s...")
+            await asyncio.sleep(delay)
+    raise AIClientError(f"Quá tải sau {MAX_RETRIES} lần thử: {last_error}")
 
 
 async def _generate_summary(
