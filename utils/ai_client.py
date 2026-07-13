@@ -12,6 +12,19 @@ import httpx
 CONCURRENCY_LIMIT = 2
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 2.0
+PROVIDER_MIN_REQUEST_INTERVAL = {
+    "openai": 1.0,
+    "claude": 1.0,
+    "gemini": 4.0,
+    "custom": 1.0,
+}
+
+_PROVIDER_RATE_LOCKS = {
+    provider: asyncio.Lock() for provider in PROVIDER_MIN_REQUEST_INTERVAL
+}
+_LAST_PROVIDER_REQUEST_AT = {
+    provider: 0.0 for provider in PROVIDER_MIN_REQUEST_INTERVAL
+}
 
 
 MAX_INPUT_CHARS = 1_000_000
@@ -54,13 +67,21 @@ MAX_OUTPUT_TOKENS: dict[str, int] = {
 }
 PROMPT_OVERHEAD_TOKENS = 1500
 
+PROVIDER_MAX_INPUT_CHARS: dict[str, int] = {
+    "openai": 60_000,
+    "claude": 60_000,
+    "gemini": 60_000,
+    "custom": 60_000,
+}
+
 
 def _max_input_chars(provider: str, model: str) -> int:
     model_map = MODEL_CONTEXT_WINDOWS.get(provider, {})
     context = model_map.get(model) or model_map.get("*", 131072)
     max_output = MAX_OUTPUT_TOKENS.get(provider, 8192)
     available_tokens = context - max_output - PROMPT_OVERHEAD_TOKENS
-    return max(available_tokens * 4, 4000)
+    context_chars = max(available_tokens * 4, 4000)
+    return min(context_chars, PROVIDER_MAX_INPUT_CHARS.get(provider, 60_000))
 
 
 SECTION_KEYWORDS = (
@@ -132,6 +153,15 @@ class AIClientError(Exception):
     """Raised when an AI provider request fails."""
 
 
+class AIClientRateLimitError(AIClientError):
+    def __init__(
+        self, message: str, retry_after: float | None = None, is_quota: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.is_quota = is_quota
+
+
 async def list_available_models(
     provider: str, api_key: str, base_url: str
 ) -> dict[str, Any]:
@@ -146,19 +176,30 @@ async def list_available_models(
         return {"source": "default", "models": DEFAULT_MODEL_OPTIONS[provider]}
 
     if provider == "openai":
-        models = await _list_openai_compatible_models(
-            api_key=api_key,
-            base_url="https://api.openai.com/v1",
+        models = await _retry_provider_call(
+            provider,
+            lambda: _list_openai_compatible_models(
+                api_key=api_key,
+                base_url="https://api.openai.com/v1",
+                provider="openai",
+            ),
         )
     elif provider == "claude":
-        models = await _list_claude_models(api_key=api_key)
+        models = await _retry_provider_call(
+            provider, lambda: _list_claude_models(api_key=api_key)
+        )
     elif provider == "gemini":
-        models = await _list_gemini_models(api_key=api_key)
+        models = await _retry_provider_call(
+            provider, lambda: _list_gemini_models(api_key=api_key)
+        )
     else:
         if not base_url:
             raise AIClientError("Provider custom cần base URL để tải danh sách model.")
-        models = await _list_openai_compatible_models(
-            api_key=api_key, base_url=base_url
+        models = await _retry_provider_call(
+            provider,
+            lambda: _list_openai_compatible_models(
+                api_key=api_key, base_url=base_url, provider="custom"
+            ),
         )
 
     return {"source": "live", "models": models or DEFAULT_MODEL_OPTIONS[provider]}
@@ -745,27 +786,91 @@ async def _call_with_retry(
     last_error = ""
     for attempt in range(MAX_RETRIES):
         try:
+            await _throttle_provider(provider)
             return await _generate_summary(
                 provider=provider, model=model, api_key=api_key,
                 base_url=base_url, prompt=prompt,
             )
-        except AIClientError as exc:
-            msg = str(exc).lower()
+        except AIClientRateLimitError as exc:
             last_error = str(exc)
-            is_rate = any(k in msg for k in (
-                "high demand", "rate limit", "too many", "429", "503",
-                "capacity", "overloaded", "try again", "quota exceeded",
-                "quota", "retry", "resource exhausted", "limit",
-            ))
-            if not is_rate or attempt == MAX_RETRIES - 1:
-                raise
-            # Parse "retry in Xs" từ error message (Gemini gửi exact time)
-            import re
-            m = re.search(r"retry in\s+([\d.]+)\s*s", str(exc), re.IGNORECASE)
-            delay = float(m.group(1)) + 1 if m else RETRY_BASE_DELAY * (2 ** attempt)
-            print(f"  API busy (lần {attempt+1}), đợi {delay:.0f}s...")
+            if attempt == MAX_RETRIES - 1:
+                raise AIClientError(
+                    _provider_rate_limit_message(
+                        provider=provider,
+                        error=last_error,
+                        is_quota=exc.is_quota,
+                    )
+                ) from exc
+            delay = exc.retry_after
+            if delay is None:
+                delay = _retry_after_from_message(last_error)
+            if delay is None:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+            print(f"  API busy (attempt {attempt + 1}), wait {delay:.0f}s...")
             await asyncio.sleep(delay)
-    raise AIClientError(f"Quá tải sau {MAX_RETRIES} lần thử: {last_error}")
+        except AIClientError:
+            raise
+    raise AIClientError(f"Qua tai sau {MAX_RETRIES} lan thu: {last_error}")
+
+
+async def _throttle_provider(provider: str) -> None:
+    min_interval = PROVIDER_MIN_REQUEST_INTERVAL.get(provider, 0.0)
+    if min_interval <= 0:
+        return
+
+    async with _PROVIDER_RATE_LOCKS[provider]:
+        now = asyncio.get_running_loop().time()
+        wait_for = min_interval - (now - _LAST_PROVIDER_REQUEST_AT[provider])
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _LAST_PROVIDER_REQUEST_AT[provider] = asyncio.get_running_loop().time()
+
+
+def _provider_rate_limit_message(provider: str, error: str, is_quota: bool) -> str:
+    provider_name = {
+        "openai": "OpenAI",
+        "claude": "Claude",
+        "gemini": "Gemini",
+        "custom": "Provider custom",
+    }.get(provider, provider)
+    if is_quota:
+        return (
+            f"{provider_name} da vuot gioi han quota hoac request. Ung dung da tu dong "
+            f"cho va thu lai {MAX_RETRIES} lan nhung van bi gioi han. Hay doi it phut roi "
+            "thu lai, giam kich thuoc tai lieu, doi model/API key, hoac kiem tra billing/"
+            f"rate limits cua {provider_name}. Chi tiet goc: {error}"
+        )
+    return (
+        f"{provider_name} dang gioi han toc do hoac qua tai tam thoi. Ung dung da tu dong "
+        f"thu lai {MAX_RETRIES} lan. Hay thu lai sau it phut. Chi tiet goc: {error}"
+    )
+
+
+async def _retry_provider_call(
+    provider: str, operation: Any
+) -> Any:
+    last_error = ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            await _throttle_provider(provider)
+            return await operation()
+        except AIClientRateLimitError as exc:
+            last_error = str(exc)
+            if attempt == MAX_RETRIES - 1:
+                raise AIClientError(
+                    _provider_rate_limit_message(
+                        provider=provider,
+                        error=last_error,
+                        is_quota=exc.is_quota,
+                    )
+                ) from exc
+            delay = exc.retry_after
+            if delay is None:
+                delay = _retry_after_from_message(last_error)
+            if delay is None:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+            await asyncio.sleep(delay)
+    raise AIClientError(f"Qua tai sau {MAX_RETRIES} lan thu: {last_error}")
 
 
 async def _generate_summary(
@@ -807,6 +912,7 @@ async def _call_openai_compatible(
         url=f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
         payload=payload,
+        provider="custom",
     )
 
     try:
@@ -830,6 +936,7 @@ async def _call_openai_responses(api_key: str, model: str, prompt: str) -> str:
         url="https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {api_key}"},
         payload=payload,
+        provider="openai",
     )
 
     output_text = data.get("output_text")
@@ -865,6 +972,7 @@ async def _call_claude(api_key: str, model: str, prompt: str) -> str:
             "anthropic-version": "2023-06-01",
         },
         payload=payload,
+        provider="claude",
     )
 
     try:
@@ -885,6 +993,7 @@ async def _call_gemini(api_key: str, model: str, prompt: str) -> str:
         url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
         headers={},
         payload=payload,
+        provider="gemini",
     )
 
     try:
@@ -893,10 +1002,13 @@ async def _call_gemini(api_key: str, model: str, prompt: str) -> str:
         raise AIClientError("Gemini tra ve du lieu khong dung dinh dang.") from exc
 
 
-async def _list_openai_compatible_models(api_key: str, base_url: str) -> list[str]:
+async def _list_openai_compatible_models(
+    api_key: str, base_url: str, provider: str
+) -> list[str]:
     data = await _get_json(
         url=f"{base_url}/models",
         headers={"Authorization": f"Bearer {api_key}"},
+        provider=provider,
     )
     raw_models = data.get("data", [])
     ids = [
@@ -914,6 +1026,7 @@ async def _list_claude_models(api_key: str) -> list[str]:
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         },
+        provider="claude",
     )
     raw_models = data.get("data", [])
     ids = [
@@ -928,6 +1041,7 @@ async def _list_gemini_models(api_key: str) -> list[str]:
     data = await _get_json(
         url=f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
         headers={},
+        provider="gemini",
     )
     raw_models = data.get("models", [])
     ids = []
@@ -944,7 +1058,7 @@ async def _list_gemini_models(api_key: str) -> list[str]:
 
 
 async def _post_json(
-    url: str, headers: dict[str, str], payload: dict[str, Any]
+    url: str, headers: dict[str, str], payload: dict[str, Any], provider: str
 ) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -953,7 +1067,7 @@ async def _post_json(
         raise AIClientError(f"Khong ket noi duoc toi AI provider: {exc}") from exc
 
     if response.status_code >= 400:
-        raise AIClientError(_provider_error_message(response))
+        _raise_provider_http_error(provider, response)
 
     try:
         return response.json()
@@ -979,7 +1093,98 @@ def _provider_error_message(response: httpx.Response) -> str:
     return f"Provider bao loi HTTP {response.status_code}."
 
 
-async def _get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
+def _raise_provider_http_error(provider: str, response: httpx.Response) -> None:
+    message = _provider_error_message(response)
+    is_rate = response.status_code in (429, 503) or _looks_like_rate_limit(message)
+    if is_rate:
+        raise AIClientRateLimitError(
+            message=message,
+            retry_after=_retry_after_from_response(response) or _retry_after_from_message(message),
+            is_quota=_looks_like_quota(message),
+        )
+    raise AIClientError(message)
+
+
+def _looks_like_rate_limit(message: str) -> bool:
+    msg = message.lower()
+    return any(
+        keyword in msg
+        for keyword in (
+            "high demand",
+            "rate limit",
+            "too many",
+            "429",
+            "503",
+            "capacity",
+            "overloaded",
+            "try again",
+            "quota exceeded",
+            "quota",
+            "retry",
+            "resource exhausted",
+            "limit",
+        )
+    )
+
+
+def _looks_like_quota(message: str) -> bool:
+    msg = message.lower()
+    return any(
+        keyword in msg
+        for keyword in (
+            "quota exceeded",
+            "insufficient_quota",
+            "resource exhausted",
+            "free tier",
+            "billing",
+            "credit",
+        )
+    )
+
+
+def _retry_after_from_response(response: httpx.Response) -> float | None:
+    header_candidates = (
+        response.headers.get("retry-after"),
+        response.headers.get("retry-after-ms"),
+        response.headers.get("x-ratelimit-reset-after"),
+    )
+    for raw_value in header_candidates:
+        delay = _coerce_retry_delay(raw_value)
+        if delay is not None:
+            return delay
+    return None
+
+
+def _retry_after_from_message(message: str) -> float | None:
+    patterns = (
+        r"retry in\s+([\d.]+)\s*s",
+        r"try again in\s+([\d.]+)\s*s",
+        r"available in\s+([\d.]+)\s*s",
+        r"after\s+([\d.]+)\s*s",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            return float(match.group(1)) + 1
+    return None
+
+
+def _coerce_retry_delay(raw_value: str | None) -> float | None:
+    if not raw_value:
+        return None
+    value = raw_value.strip()
+    try:
+        delay = float(value)
+    except ValueError:
+        return None
+    if "ms" in value.lower():
+        delay = delay / 1000
+    if delay < 0:
+        return None
+    return delay + 1
+
+
+async def _get_json(url: str, headers: dict[str, str], provider: str) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.get(url, headers=headers)
@@ -987,7 +1192,7 @@ async def _get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
         raise AIClientError(f"Khong ket noi duoc toi AI provider: {exc}") from exc
 
     if response.status_code >= 400:
-        raise AIClientError(_provider_error_message(response))
+        _raise_provider_http_error(provider, response)
 
     try:
         return response.json()
